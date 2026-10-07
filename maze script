@@ -1,0 +1,367 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local PathfindingService = game:GetService("PathfindingService")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local camera = workspace.CurrentCamera
+local npc = workspace:WaitForChild("SirYeet")
+
+local STOP_DIST = 5
+local FEEL_RANGE = 5
+local REPATH_EVERY = 2.5
+local JITTER = 0.9
+
+local function getFocusPart()
+	return npc:FindFirstChild("Head")
+		or npc:FindFirstChild("HumanoidRootPart")
+		or npc.PrimaryPart
+		or npc:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getFocusPosition()
+	local part = getFocusPart()
+	return part and part.Position or npc:GetPivot().Position
+end
+
+local highlightOn = true
+local camLocked = false
+local camDistance = 15
+local camAngleX = 20
+local camAngleY = 0
+local lastMousePos = nil
+
+local highlight = Instance.new("Highlight")
+highlight.Adornee = npc
+highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+highlight.FillColor = Color3.fromRGB(255, 40, 40)
+highlight.FillTransparency = 0.5
+highlight.OutlineColor = Color3.fromRGB(255, 0, 0)
+highlight.OutlineTransparency = 0
+highlight.Parent = npc
+
+local tag = Instance.new("BillboardGui")
+tag.Size = UDim2.new(0, 160, 0, 40)
+tag.StudsOffset = Vector3.new(0, 3, 0)
+tag.AlwaysOnTop = true
+tag.Adornee = getFocusPart()
+tag.Parent = playerGui
+
+local tagLabel = Instance.new("TextLabel")
+tagLabel.Size = UDim2.new(1, 0, 1, 0)
+tagLabel.BackgroundTransparency = 1
+tagLabel.Font = Enum.Font.GothamBold
+tagLabel.TextSize = 14
+tagLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
+tagLabel.TextStrokeTransparency = 0.3
+tagLabel.Text = npc.Name
+tagLabel.Parent = tag
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "NpcViewerUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = playerGui
+
+local function makeButton(text, posX, color)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(0, 120, 0, 32)
+	btn.Position = UDim2.new(0.5, posX, 1, -130)
+	btn.BackgroundColor3 = color
+	btn.BorderSizePixel = 0
+	btn.Font = Enum.Font.Code
+	btn.TextSize = 13
+	btn.TextColor3 = Color3.new(1, 1, 1)
+	btn.Text = text
+	btn.Parent = gui
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+	return btn
+end
+
+local toggleBtn = makeButton("hide highlight [H]", -195, Color3.fromRGB(200, 40, 40))
+local camBtn = makeButton("view npc [V]", -65, Color3.fromRGB(30, 30, 30))
+local walkBtn = makeButton("walk to npc [G]", 65, Color3.fromRGB(30, 30, 30))
+
+local function setHighlight(on)
+	highlightOn = on
+	highlight.Enabled = on
+	tag.Enabled = on
+	toggleBtn.Text = on and "hide highlight [H]" or "show highlight [H]"
+	toggleBtn.BackgroundColor3 = on and Color3.fromRGB(200, 40, 40) or Color3.fromRGB(50, 50, 50)
+end
+
+local function setCam(on)
+	camLocked = on
+	if on then
+		camera.CameraType = Enum.CameraType.Scriptable
+		camBtn.Text = "exit cam [V]"
+		camBtn.BackgroundColor3 = Color3.fromRGB(20, 80, 160)
+	else
+		camera.CameraType = Enum.CameraType.Custom
+		local char = player.Character
+		camera.CameraSubject = char and char:FindFirstChildOfClass("Humanoid") or nil
+		camBtn.Text = "view npc [V]"
+		camBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		lastMousePos = nil
+	end
+end
+
+local walking = false
+local walkToken = 0
+local wpList = {}
+local wpIdx = 1
+local heading = Vector3.new(0, 0, -1)
+local pauseUntil = 0
+local noiseSeed = 0
+local lastCut = 0
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function flat(v)
+	return Vector3.new(v.X, 0, v.Z)
+end
+
+local function getGoal()
+	local part = npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart
+	local pos = part and part.Position or getFocusPosition()
+	local ground = workspace:Raycast(pos, Vector3.new(0, -15, 0), rayParams)
+	return ground and ground.Position or pos
+end
+
+local function stopWalk(label)
+	walking = false
+	walkToken += 1
+	wpList = {}
+	wpIdx = 1
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then hum:Move(Vector3.zero, false) end
+	walkBtn.Text = label or "walk to npc [G]"
+	walkBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	if label then
+		task.delay(1.5, function()
+			if not walking then walkBtn.Text = "walk to npc [G]" end
+		end)
+	end
+end
+
+local function clearLine(a, b)
+	if workspace:Spherecast(a, 1.6, b - a, rayParams) then
+		return false
+	end
+	for _, t in {0.33, 0.66, 1} do
+		local p = a:Lerp(b, t)
+		local g = workspace:Raycast(p + Vector3.new(0, 1, 0), Vector3.new(0, -9, 0), rayParams)
+		if not g or math.abs(g.Position.Y - (b.Y - (a.Y - g.Position.Y) + (a.Y - g.Position.Y))) > 1e9 then
+			return false
+		end
+	end
+	return true
+end
+
+local function startWalk()
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not root or not hum or hum.Health <= 0 then return end
+	walking = true
+	walkToken += 1
+	local token = walkToken
+	rayParams.FilterDescendantsInstances = {char, npc}
+	heading = flat(root.CFrame.LookVector)
+	if heading.Magnitude < 0.01 then heading = Vector3.new(0, 0, -1) end
+	heading = heading.Unit
+	wpList, wpIdx, pauseUntil = {}, 1, 0
+	noiseSeed = math.random() * 100
+	walkBtn.Text = "stop walking [G]"
+	walkBtn.BackgroundColor3 = Color3.fromRGB(20, 120, 80)
+	local path = PathfindingService:CreatePath({
+		AgentRadius = 2.5,
+		AgentHeight = 5,
+		AgentCanJump = true,
+		AgentCanClimb = false,
+		WaypointSpacing = 4,
+	})
+	task.spawn(function()
+		local lastPathTime, lastGoal = 0, nil
+		local lastPos, lastPosTime = root.Position, os.clock()
+		local fails = 0
+		while walking and token == walkToken do
+			local c = player.Character
+			local r = c and c:FindFirstChild("HumanoidRootPart")
+			local h = c and c:FindFirstChildOfClass("Humanoid")
+			if not r or not h or h.Health <= 0 then break end
+			local now = os.clock()
+			local goal = getGoal()
+			local stuck = false
+			if now - lastPosTime > 1.5 then
+				stuck = flat(r.Position - lastPos).Magnitude < 1 and now > pauseUntil
+				lastPos, lastPosTime = r.Position, now
+			end
+			if stuck then h.Jump = true end
+			local needPath = #wpList == 0
+				or stuck
+				or now - lastPathTime > REPATH_EVERY
+				or (lastGoal and (goal - lastGoal).Magnitude > 8)
+			if needPath then
+				lastPathTime, lastGoal = now, goal
+				local ok = pcall(function()
+					path:ComputeAsync(r.Position, goal)
+				end)
+				if ok and path.Status == Enum.PathStatus.Success then
+					fails = 0
+					local raw = path:GetWaypoints()
+					local list = {}
+					for i, wp in raw do
+						local pos = wp.Position
+						if i > 1 and i < #raw then
+							local dir = flat(raw[i + 1].Position - raw[i - 1].Position)
+							if dir.Magnitude > 0.01 then
+								dir = dir.Unit
+								local perp = Vector3.new(-dir.Z, 0, dir.X)
+								local off = (math.random() * 2 - 1) * JITTER
+								local clear = off + (off >= 0 and 1.6 or -1.6)
+								if not workspace:Raycast(pos + Vector3.new(0, 2.5, 0), perp * clear, rayParams) then
+									pos = pos + perp * off
+								end
+							end
+						end
+						list[i] = {pos = pos, jump = wp.Action == Enum.PathWaypointAction.Jump}
+					end
+					wpList = list
+					wpIdx = math.min(2, #list)
+				else
+					fails += 1
+					if fails >= 4 then
+						if token == walkToken then stopWalk("no path found") end
+						return
+					end
+				end
+			end
+			task.wait(0.2)
+		end
+		if token == walkToken then stopWalk() end
+	end)
+end
+
+local function walkStep(dt)
+	if not walking then return end
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not root or not hum then return end
+	local now = os.clock()
+	local goal = getGoal()
+	local goalDist = flat(goal - root.Position).Magnitude
+	if goalDist < STOP_DIST then
+		stopWalk()
+		return
+	end
+	if now < pauseUntil or #wpList == 0 then
+		hum:Move(Vector3.zero, false)
+		return
+	end
+	if wpIdx > #wpList then wpIdx = #wpList end
+	if now - lastCut > 0.1 and not wpList[wpIdx].jump then
+		lastCut = now
+		local best = wpIdx
+		for k = wpIdx + 1, math.min(wpIdx + 3, #wpList) do
+			local wp = wpList[k]
+			if wp.jump or math.abs(wp.pos.Y - wpList[wpIdx].pos.Y) > 1.5 then break end
+			if flat(wp.pos - root.Position).Magnitude > 16 then break end
+			local hip = Vector3.new(wp.pos.X, root.Position.Y, wp.pos.Z)
+			if clearLine(root.Position, hip) then best = k else break end
+		end
+		wpIdx = best
+	end
+	local tgt = wpList[wpIdx].pos
+	if flat(tgt - root.Position).Magnitude < 2.5 and wpIdx < #wpList then
+		wpIdx += 1
+		tgt = wpList[wpIdx].pos
+		if wpList[wpIdx].jump then hum.Jump = true end
+		if math.random() < 0.06 then
+			pauseUntil = now + 0.15 + math.random() * 0.25
+		end
+	end
+	local to = flat(tgt - root.Position)
+	local desired = to.Magnitude > 0.05 and to.Unit or heading
+	local repel = Vector3.zero
+	for _, ang in {-70, -35, 0, 35, 70} do
+		local d = CFrame.Angles(0, math.rad(ang), 0):VectorToWorldSpace(heading)
+		local hit = workspace:Raycast(root.Position, d * FEEL_RANGE, rayParams)
+		if hit and hit.Normal.Y < 0.6 then
+			local w = 1 - (hit.Position - root.Position).Magnitude / FEEL_RANGE
+			repel -= d * w
+		end
+	end
+	desired = desired + repel * 0.9
+	if desired.Magnitude < 0.01 then desired = heading end
+	desired = desired.Unit
+	local newHeading = heading:Lerp(desired, 1 - math.exp(-dt * 7))
+	heading = newHeading.Magnitude > 0.05 and newHeading.Unit or desired
+	local turn = math.acos(math.clamp(heading:Dot(desired), -1, 1))
+	local scale = math.clamp(0.88 + 0.24 * math.noise(now * 0.6, noiseSeed), 0.7, 1)
+	scale *= 1 - 0.4 * math.clamp(turn / 1.2, 0, 1)
+	if goalDist < 12 then scale *= 0.85 end
+	scale = math.max(scale, 0.5)
+	hum:Move(heading * scale, false)
+end
+
+RunService:BindToRenderStep("NpcAutoWalk", Enum.RenderPriority.Input.Value + 1, walkStep)
+
+local function toggleWalk()
+	if walking then stopWalk() else startWalk() end
+end
+
+toggleBtn.MouseButton1Click:Connect(function() setHighlight(not highlightOn) end)
+camBtn.MouseButton1Click:Connect(function() setCam(not camLocked) end)
+walkBtn.MouseButton1Click:Connect(toggleWalk)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	local k = input.KeyCode
+	if k == Enum.KeyCode.H then
+		setHighlight(not highlightOn)
+	elseif k == Enum.KeyCode.V then
+		setCam(not camLocked)
+	elseif k == Enum.KeyCode.G then
+		toggleWalk()
+	elseif walking and (k == Enum.KeyCode.W or k == Enum.KeyCode.A or k == Enum.KeyCode.S or k == Enum.KeyCode.D) then
+		stopWalk()
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if camLocked and input.UserInputType == Enum.UserInputType.MouseWheel then
+		camDistance = math.clamp(camDistance - input.Position.Z * 3, 5, 80)
+	end
+end)
+
+RunService.RenderStepped:Connect(function()
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root then
+		local dist = (root.Position - getFocusPosition()).Magnitude
+		tagLabel.Text = string.format("%s\n%d studs", npc.Name, dist)
+	end
+	if not camLocked then return end
+	local mousePos = UserInputService:GetMouseLocation()
+	if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+		if lastMousePos then
+			local delta = mousePos - lastMousePos
+			camAngleY -= delta.X * 0.4
+			camAngleX = math.clamp(camAngleX - delta.Y * 0.4, 5, 80)
+		end
+		lastMousePos = mousePos
+	else
+		lastMousePos = nil
+	end
+	local rx, ry = math.rad(camAngleX), math.rad(camAngleY)
+	local offset = Vector3.new(
+		math.sin(ry) * math.cos(rx),
+		math.sin(rx),
+		math.cos(ry) * math.cos(rx)
+	) * camDistance
+	local focus = getFocusPosition()
+	camera.CFrame = CFrame.lookAt(focus + offset, focus)
+end)
